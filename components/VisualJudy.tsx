@@ -20,6 +20,32 @@ function estimateEmotion(text: string) {
   return "warm";
 }
 
+function pickJudyVoice(voices: SpeechSynthesisVoice[]) {
+  const preferredNames = [
+    /microsoft aria/i,
+    /microsoft jenny/i,
+    /microsoft zira/i,
+    /microsoft ava/i,
+    /samantha/i,
+    /victoria/i,
+    /karen/i,
+    /moira/i,
+    /serena/i,
+    /female/i,
+    /aria/i,
+    /jenny/i,
+    /zira/i,
+    /ava/i
+  ];
+
+  for (const pattern of preferredNames) {
+    const match = voices.find(v => pattern.test(v.name) && /^en/i.test(v.lang));
+    if (match) return match;
+  }
+
+  return voices.find(v => /^en-US/i.test(v.lang)) || voices.find(v => /^en/i.test(v.lang));
+}
+
 export default function VisualJudy() {
   const [status, setStatus] = useState<Status>("idle");
   const [messages, setMessages] = useState<Message[]>([
@@ -31,6 +57,7 @@ export default function VisualJudy() {
   const [emotion, setEmotion] = useState("warm");
   const recognitionRef = useRef<any>(null);
   const speakingRef = useRef(false);
+  const mouthTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const chatRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -45,62 +72,108 @@ export default function VisualJudy() {
     chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, status]);
 
+  const stopMouthAnimation = useCallback(() => {
+    if (mouthTimerRef.current) {
+      clearInterval(mouthTimerRef.current);
+      mouthTimerRef.current = null;
+    }
+    setMouthOpen(.15);
+  }, []);
+
+  const startFallbackMouthAnimation = useCallback(() => {
+    stopMouthAnimation();
+    mouthTimerRef.current = setInterval(() => {
+      if (!speakingRef.current) return;
+      const levels = [0.28, 0.48, 0.72, 0.92, 0.58, 0.35, 0.82, 0.44];
+      const next = levels[Math.floor(Math.random() * levels.length)];
+      setMouthOpen(next);
+    }, 110);
+  }, [stopMouthAnimation]);
+
   const stopSpeaking = useCallback(() => {
     window.speechSynthesis?.cancel();
     speakingRef.current = false;
-    setMouthOpen(.15);
+    stopMouthAnimation();
     setStatus("idle");
-  }, []);
+  }, [stopMouthAnimation]);
 
   const speak = useCallback((content: string) => {
     if (!("speechSynthesis" in window)) return;
     window.speechSynthesis.cancel();
+    stopMouthAnimation();
 
     const utter = new SpeechSynthesisUtterance(content);
-    utter.rate = 1.0;
-    utter.pitch = 1.0;
+    utter.rate = 0.98;
+    utter.pitch = 1.08;
     utter.volume = 1.0;
 
-    const voices = window.speechSynthesis.getVoices();
-    const preferred =
-      voices.find(v => /samantha|aria|jenny|zira|ava|female/i.test(v.name)) ||
-      voices.find(v => /^en/i.test(v.lang));
-    if (preferred) utter.voice = preferred;
+    const assignBestVoice = () => {
+      const voices = window.speechSynthesis.getVoices();
+      const preferred = pickJudyVoice(voices);
+      if (preferred) utter.voice = preferred;
+    };
+
+    assignBestVoice();
 
     utter.onstart = () => {
       speakingRef.current = true;
       setStatus("speaking");
+      startFallbackMouthAnimation();
     };
 
     utter.onboundary = (e: any) => {
-      // Browser TTS does not expose phonemes. This creates a useful V1 pseudo-viseme
-      // animation from speech boundaries. Swap this for phoneme timestamps later.
+      // If the browser exposes word boundaries, use them to vary the mouth shape.
+      // The fallback animation keeps the lips moving on browsers that do not expose boundaries.
       const seed = (e.charIndex ?? 1) % 7;
       const level = [0.25, 0.55, 0.85, 0.4, 1.0, 0.62, 0.32][seed];
       setMouthOpen(level);
-      setTimeout(() => setMouthOpen(Math.max(.18, level * .35)), 85);
+      setTimeout(() => {
+        if (speakingRef.current) setMouthOpen(Math.max(.2, level * .42));
+      }, 85);
     };
 
     utter.onend = () => {
       speakingRef.current = false;
-      setMouthOpen(.15);
+      stopMouthAnimation();
       setStatus("idle");
     };
 
     utter.onerror = () => {
       speakingRef.current = false;
+      stopMouthAnimation();
       setStatus("error");
       setTimeout(() => setStatus("idle"), 900);
     };
 
-    window.speechSynthesis.speak(utter);
-  }, []);
+    // Some browsers load the voice list asynchronously. A short retry improves Windows/Chrome voice selection.
+    if (window.speechSynthesis.getVoices().length === 0) {
+      const handleVoicesChanged = () => {
+        assignBestVoice();
+        window.speechSynthesis.removeEventListener("voiceschanged", handleVoicesChanged);
+        window.speechSynthesis.speak(utter);
+      };
+      window.speechSynthesis.addEventListener("voiceschanged", handleVoicesChanged);
+      setTimeout(() => {
+        if (!window.speechSynthesis.speaking && !window.speechSynthesis.pending) {
+          assignBestVoice();
+          window.speechSynthesis.removeEventListener("voiceschanged", handleVoicesChanged);
+          window.speechSynthesis.speak(utter);
+        }
+      }, 500);
+    } else {
+      window.speechSynthesis.speak(utter);
+    }
+  }, [startFallbackMouthAnimation, stopMouthAnimation]);
 
   const send = useCallback(async (raw: string) => {
     const userText = raw.trim();
     if (!userText) return;
 
-    if (speakingRef.current) window.speechSynthesis.cancel();
+    if (speakingRef.current) {
+      window.speechSynthesis.cancel();
+      speakingRef.current = false;
+      stopMouthAnimation();
+    }
 
     setMessages(prev => [...prev, { role: "user", text: userText }]);
     setText("");
@@ -125,7 +198,7 @@ export default function VisualJudy() {
         text: "I couldn't reach the JudyVA endpoint. Check the server configuration and try again."
       }]);
     }
-  }, [messages, speak]);
+  }, [messages, speak, stopMouthAnimation]);
 
   const startListening = useCallback(() => {
     const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -140,6 +213,7 @@ export default function VisualJudy() {
     if (speakingRef.current) {
       window.speechSynthesis.cancel();
       speakingRef.current = false;
+      stopMouthAnimation();
     }
 
     const recognition = new Recognition();
@@ -172,7 +246,7 @@ export default function VisualJudy() {
 
     recognitionRef.current = recognition;
     recognition.start();
-  }, [send]);
+  }, [send, stopMouthAnimation]);
 
   const mouthStyle = useMemo(() => ({
     transform: `translate(-50%, -50%) scaleY(${0.18 + mouthOpen * 1.5}) scaleX(${1 - mouthOpen * .08})`
@@ -233,9 +307,7 @@ export default function VisualJudy() {
           </div>
 
           <p className="small">
-            Chrome desktop is recommended for microphone recognition. The avatar uses browser TTS
-            and approximate viseme motion in this first build. Connect <kbd>JUDYVA_API_URL</kbd> to route
-            conversations into the real JudyVA engine.
+            Chrome desktop is recommended for microphone recognition. This build strongly prefers a female system voice and now includes fallback mouth animation while Judy speaks. Connect <kbd>JUDYVA_API_URL</kbd> to route conversations into the real JudyVA engine.
           </p>
         </div>
       </aside>
